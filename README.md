@@ -17,7 +17,7 @@
 
 ---
 
-> **Fork 说明**：本项目基于上游 [`Sliverkiss/traework2api`](https://github.com/Sliverkiss/traework2api) 大幅改进——新增 Work 通道、`work_client.go` 私有协议、Web 管理控制台、加权防惊群调度等，本仓库独立演进。
+> **借鉴说明**：本项目基于上游 [`Sliverkiss/traework2api`](https://github.com/Sliverkiss/traework2api) 改进，新增 Work 通道、`work_client.go` 私有协议、Web 管理控制台、加权防惊群调度等能力。
 
 ## 概述
 
