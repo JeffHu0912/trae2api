@@ -1,0 +1,21 @@
+services:
+  trae2api:
+    build: .
+    container_name: trae2api
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+      - TW2A_API_KEY=${TW2A_API_KEY:?set TW2A_API_KEY in .env or shell}
+      # Work 通道运行模式：auto (智能自动模式，推荐) | native | bridge | disabled
+      - TW2A_WORK_MODE=${TW2A_WORK_MODE:-auto}
+      - TW2A_WORK_BRIDGE_URL=${TW2A_WORK_BRIDGE_URL:-http://host-gateway:7865}
+      - TW2A_WORK_BRIDGE_TOKEN=${TW2A_WORK_BRIDGE_TOKEN:-twbridge-local-7f3a}
+    extra_hosts:
+      - "host-gateway:host-gateway"
+    ports:
+      - "7864:7864"
+      - "18080:18080"
+    volumes:
+      - ./auths:/app/auths
+      - ./data:/app/data
+      - ./config.json:/app/config.json:ro

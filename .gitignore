@@ -1,0 +1,48 @@
+# 凭证与密钥(绝不 commit)
+auths/
+data/
+config.json
+.env
+*.key
+*.pem
+
+# 二进制
+login
+signin
+credit
+signin_bin
+trae2api
+/verify_work_credits
+/server
+
+# 文档(doc 排除上传): 本地 md 不入库,README 与核心规范除外
+*.md
+!README.md
+docs/*
+!docs/RESEARCH.md
+!docs/logo.svg
+!docs/PLAN-SCHEME-2-PURE-PROTOCOL.md
+!docs/work-wire-protocol-spec.md
+!docs/work-crypto-algorithm.md
+
+# 构建产物与抓包数据
+*.tmp
+*.log
+*.test
+__pycache__/
+frida/*.app/
+frida/*.log
+frida/captured_work_packet.json
+frida/*_captured_*.json
+trae2api-bin
+trae2api-web-bin
+
+# 系统与 IDE
+.DS_Store
+*/.DS_Store
+.idea/
+.vscode/
+
+# 任务输入文档
+tickets/
+reference_workbuddy2api/
