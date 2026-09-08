@@ -51,6 +51,13 @@ type Status struct {
 	Disabled bool `json:"disabled"`
 	Enabled  bool `json:"enabled"`
 	ErrCount int  `json:"err_count,omitempty"`
+
+	// 运行态指标（借鉴自 workbuddy2api）
+	InFlight     int       `json:"in_flight"`
+	SuccessCount int64     `json:"success_count,omitempty"`
+	ErrTotal     int64     `json:"err_total,omitempty"`
+	LastSuccess  time.Time `json:"last_success,omitempty"`
+	LastErr      time.Time `json:"last_err,omitempty"`
 }
 
 type entry struct {
@@ -65,6 +72,14 @@ type entry struct {
 	workUntil    time.Time
 	errCount     int
 	workErrCount int
+
+	// 运行态在途租约与三因子统计
+	inFlight     int
+	lastUsed     time.Time
+	successCount int64
+	errTotal     int64
+	lastSuccess  time.Time
+	lastErr      time.Time
 }
 
 func (e *entry) healthy(now time.Time) bool {
@@ -111,6 +126,7 @@ type Pool struct {
 	stateFp     string
 	affinity    map[string]affinityEntry
 	affinityTTL time.Duration
+	maxInFlight int
 }
 
 type affinityEntry struct {
@@ -125,11 +141,68 @@ func New(stateFp string) *Pool {
 		stateFp:     stateFp,
 		affinity:    map[string]affinityEntry{},
 		affinityTTL: 30 * time.Minute,
+		maxInFlight: 3,
 	}
 	if stateFp != "" {
 		p.load()
 	}
 	return p
+}
+
+// SetMaxInFlight 设置单账号最大并发在途请求数（<=0 表示不限制）。
+func (p *Pool) SetMaxInFlight(n int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.maxInFlight = n
+}
+
+// inFlightFull 报告账号是否已占满在途名额（maxInFlight<=0 时恒 false）。
+func (p *Pool) inFlightFull(e *entry) bool {
+	if p.maxInFlight <= 0 {
+		return false
+	}
+	return e.inFlight >= p.maxInFlight
+}
+
+// Acquire 尝试为指定账号获取在途并发名额（无论是否满载均计数，调用方需注意配合 Release）。
+func (p *Pool) Acquire(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		e.inFlight++
+		return true
+	}
+	return false
+}
+
+// Release 释放指定账号的在途并发名额。
+func (p *Pool) Release(uid string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok && e.inFlight > 0 {
+		e.inFlight--
+	}
+}
+
+// RecordSuccess 记录指定账号成功调用一次，清零连续错误计数并更新成功统计与最后成功时间。
+func (p *Pool) RecordSuccess(uid string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		e.successCount++
+		e.lastSuccess = time.Now()
+		e.errCount = 0
+	}
+}
+
+// RecordError 记录指定账号错误一次，累计总错误数。
+func (p *Pool) RecordError(uid string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		e.errTotal++
+		e.lastErr = time.Now()
+	}
 }
 
 // Add 加入账号；已存在则保留原状态、更新凭证。
@@ -228,28 +301,38 @@ func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
 	return best.a
 }
 
-// PickAffinity 优先按 sessionKey 会话粘性返回健康账号；未命中或已冷却则降级择优并绑定，
-// 保持同一会话持续使用同一账号，最大化大模型服务端 Prompt/KV Cache 命中率。
-func (p *Pool) PickAffinity(sessionKey string, tried map[string]bool) *auth.Auth {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	now := time.Now()
+const minPickGap = 100 * time.Millisecond
 
-	// 1. 若提供了 sessionKey，优先复用健康的已有绑定账号
-	if sessionKey != "" {
-		if aff, ok := p.affinity[sessionKey]; ok {
-			if tried == nil || !tried[aff.uid] {
-				if e, exists := p.byUID[aff.uid]; exists && e.healthy(now) {
-					aff.lastSeen = now
-					p.affinity[sessionKey] = aff
-					return e.a
-				}
+// weightOf 计算三因子调度权重（借鉴自 workbuddy2api）：
+// 1. credits 占比 × 10
+// 2. 闲置补偿（每闲置 1h 权重 +0.5，上限 5.0）
+// 3. 历史成功率 × 3
+func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
+	w := 1.0
+	if maxCredits > 0 && e.credits > 0 {
+		w += (float64(e.credits) / float64(maxCredits)) * 10.0
+	}
+	if !e.lastUsed.IsZero() {
+		idleH := now.Sub(e.lastUsed).Hours()
+		if idleH > 0 {
+			idleW := idleH * 0.5
+			if idleW > 5.0 {
+				idleW = 5.0
 			}
+			w += idleW
 		}
 	}
+	total := e.successCount + e.errTotal
+	if total > 0 {
+		sr := float64(e.successCount) / float64(total)
+		w += sr * 3.0
+	}
+	return w
+}
 
-	// 2. 无粘性绑定或原账号已不可用/已尝试，重新选择积分最高者（同分按 UID 稳定排序）
-	var best *entry
+// pickBestCandidateLocked 综合健康检查、在途租约、三因子权重与防惊群窗口选号。
+func (p *Pool) pickBestCandidateLocked(tried map[string]bool, now time.Time) *entry {
+	var cands []*entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
 			continue
@@ -257,10 +340,96 @@ func (p *Pool) PickAffinity(sessionKey string, tried map[string]bool) *auth.Auth
 		if !e.healthy(now) {
 			continue
 		}
-		if best == nil || e.credits > best.credits || (e.credits == best.credits && uid < best.a.UID) {
-			best = e
+		if p.inFlightFull(e) {
+			continue
+		}
+		cands = append(cands, e)
+	}
+	// 若全部健康账号均占满在途并发，放宽在途限制
+	if len(cands) == 0 {
+		for uid, e := range p.byUID {
+			if tried != nil && tried[uid] {
+				continue
+			}
+			if e.healthy(now) {
+				cands = append(cands, e)
+			}
 		}
 	}
+	if len(cands) == 0 {
+		return nil
+	}
+
+	var maxCredits int64
+	for _, e := range cands {
+		if e.credits > maxCredits {
+			maxCredits = e.credits
+		}
+	}
+
+	type weighted struct {
+		e *entry
+		w float64
+	}
+	ws := make([]weighted, len(cands))
+	for i, e := range cands {
+		ws[i] = weighted{e: e, w: p.weightOf(e, maxCredits, now)}
+	}
+	sort.Slice(ws, func(i, j int) bool {
+		if ws[i].w != ws[j].w {
+			return ws[i].w > ws[j].w
+		}
+		return ws[i].e.a.UID < ws[j].e.a.UID
+	})
+	top := make([]*entry, 0, 5)
+	for i := 0; i < len(ws) && i < 5; i++ {
+		top = append(top, ws[i].e)
+	}
+
+	eligible := make([]*entry, 0, len(top))
+	for _, e := range top {
+		if now.Sub(e.lastUsed) >= minPickGap {
+			eligible = append(eligible, e)
+		}
+	}
+	var selected *entry
+	if len(eligible) == 0 {
+		selected = top[0]
+		for _, c := range top[1:] {
+			if c.lastUsed.Before(selected.lastUsed) {
+				selected = c
+			}
+		}
+	} else {
+		selected = eligible[0]
+	}
+	selected.lastUsed = now
+	return selected
+}
+
+// PickAffinity 优先按 sessionKey 会话粘性返回健康账号；未命中或已冷却则降级择优并绑定，
+// 保持同一会话持续使用同一账号，最大化大模型服务端 Prompt/KV Cache 命中率。
+func (p *Pool) PickAffinity(sessionKey string, tried map[string]bool) *auth.Auth {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+
+	// 1. 若提供了 sessionKey，优先复用健康的已有绑定账号（且未占满在途并发）
+	if sessionKey != "" {
+		if aff, ok := p.affinity[sessionKey]; ok {
+			if tried == nil || !tried[aff.uid] {
+				if e, exists := p.byUID[aff.uid]; exists && e.healthy(now) && !p.inFlightFull(e) {
+					aff.lastSeen = now
+					p.affinity[sessionKey] = aff
+					e.lastUsed = now
+					return e.a
+				}
+			}
+		}
+	}
+
+	// 2. 无粘性绑定或原账号已不可用/已满载，走三因子加权与防惊群短名单调度
+	best := p.pickBestCandidateLocked(tried, now)
 	if best == nil {
 		return nil
 	}
@@ -272,7 +441,7 @@ func (p *Pool) PickAffinity(sessionKey string, tried map[string]bool) *auth.Auth
 			lastSeen: now,
 		}
 		// 惰性清理过期会话
-		if len(p.affinity) > 200 {
+		if len(p.affinity) > 500 {
 			for k, v := range p.affinity {
 				if now.Sub(v.lastSeen) > p.affinityTTL {
 					delete(p.affinity, k)
@@ -536,19 +705,24 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		nick = e.a.Nickname
 	}
 	return Status{
-		UID:         uid,
-		Nickname:    nick,
-		Credits:     e.credits,
-		WorkCredits: e.workCredits,
-		Cooling:     !e.until.IsZero() && now.Before(e.until),
-		Until:       e.until,
-		Reason:      e.reason,
-		WorkCooling: !e.workUntil.IsZero() && now.Before(e.workUntil),
-		WorkUntil:   e.workUntil,
-		WorkReason:  e.workReason,
-		Disabled:    e.disabled,
-		Enabled:     e.enabled,
-		ErrCount:    e.errCount,
+		UID:          uid,
+		Nickname:     nick,
+		Credits:      e.credits,
+		WorkCredits:  e.workCredits,
+		Cooling:      !e.until.IsZero() && now.Before(e.until),
+		Until:        e.until,
+		Reason:       e.reason,
+		WorkCooling:  !e.workUntil.IsZero() && now.Before(e.workUntil),
+		WorkUntil:    e.workUntil,
+		WorkReason:   e.workReason,
+		Disabled:     e.disabled,
+		Enabled:      e.enabled,
+		ErrCount:     e.errCount,
+		InFlight:     e.inFlight,
+		SuccessCount: e.successCount,
+		ErrTotal:     e.errTotal,
+		LastSuccess:  e.lastSuccess,
+		LastErr:      e.lastErr,
 	}
 }
 

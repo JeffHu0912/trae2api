@@ -537,10 +537,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.Unmarshal(body, &peek)
 
+	// 请求级统计：出口打印表格日志
+	st := newChatStat(time.Now(), body, peek.Stream)
+	defer st.done()
+
 	sessionKey := extractSessionKey(r, body)
 
 	configName, err := h.mapModel(peek.Model)
 	if err != nil {
+		st.status = http.StatusBadRequest
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
@@ -558,18 +563,37 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 若显式请求 Work 模型（且未携带外部自定义 tools），走 Work 通道多账号动态调度（带会话粘性，消费 work_credits）
 	if isWorkModel(peek.Model) && !hasTools {
 		if h.cfg.WorkMode == upstream.WorkModeDisabled || (h.cfg.WorkClient != nil && h.cfg.WorkClient.Mode() == upstream.WorkModeDisabled) {
+			st.status = http.StatusForbidden
 			writeOpenAIError(w, http.StatusForbidden, "work_disabled", "work channel is disabled by configuration (TW2A_WORK_MODE=disabled)")
 			return
 		}
 		handled, err := h.executeWorkRequest(w, r, body, configName, peek.Stream, sessionKey)
 		if !handled {
+			st.status = http.StatusServiceUnavailable
 			msg := "all accounts unavailable for work channel"
 			if err != nil {
 				msg += ": " + err.Error()
 			}
 			writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account", msg)
+		} else {
+			st.status = http.StatusOK
 		}
 		return
+	}
+
+	// 在途租约管理：出口统一释放
+	var heldUID string
+	defer func() {
+		if heldUID != "" {
+			h.cfg.Pool.Release(heldUID)
+		}
+	}()
+	acquireAcct := func(uid string) {
+		if heldUID != "" {
+			h.cfg.Pool.Release(heldUID)
+		}
+		heldUID = uid
+		h.cfg.Pool.Acquire(uid)
 	}
 
 	tried := map[string]bool{}
@@ -580,11 +604,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		tried[acct.UID] = true
+		acquireAcct(acct.UID)
+		st.uid = acct.UID
 
 		// token 临近过期 → 先 refresh（持锁重查，避免并发重复轮换；失败冷却换号）
 		refreshed, err := h.cfg.Upstream.RefreshTokenIfNeeded(acct, h.cfg.RefreshSkew)
 		if err != nil {
 			lastErr = err
+			h.cfg.Pool.RecordError(acct.UID)
 			var ue *upstream.Error
 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
 				h.cfg.Pool.Disable(acct.UID, "refresh session dead")
@@ -600,16 +627,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		rc, status, respBody, terr := h.cfg.Upstream.ChatStream(acct, body)
 		if terr != nil {
 			lastErr = terr
+			h.cfg.Pool.RecordError(acct.UID)
 			h.cfg.Pool.NoteError(acct.UID, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
 			continue
 		}
 		if status >= 400 {
+			h.cfg.Pool.RecordError(acct.UID)
+			st.status = status
 			kind := upstream.Classify(status, string(respBody))
 			switch kind {
 			case upstream.ErrPlanLimit:
 				h.cfg.Pool.Cooldown(acct.UID, pool.CoolPlan, h.cfg.PlanCooldown, "plan 权益不足")
 				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 				if handled, _ := h.executeWorkRequest(w, r, body, configName, peek.Stream, sessionKey); handled {
+					st.status = http.StatusOK
 					return
 				}
 				continue
@@ -634,16 +665,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		if peek.Stream {
 			h.cfg.Pool.NoteSuccess(acct.UID)
+			h.cfg.Pool.RecordSuccess(acct.UID)
+			st.status = http.StatusOK
+			statsR := newChatStatsReaderSince(rc, st.start)
 			// 流内业务错误（1005 plan/5xx 等）→ 冷却账号，错误信息注入 SSE。
-			_ = upstream.StreamWithError(w, rc, func(se *upstream.SOLOStreamError) {
+			_ = upstream.StreamWithError(w, statsR, func(se *upstream.SOLOStreamError) {
 				h.handleStreamError(acct.UID, se)
 			})
 			rc.Close()
+			if toks, ok := statsR.Tokens(); ok {
+				st.toks = toks
+			}
+			st.ttfb = statsR.TTFB()
 			return
 		}
 		resp, err := upstream.Aggregate(rc)
 		rc.Close() // 已完全消费，立即释放上游连接（防轮转 continue 泄漏 body）
 		if err != nil {
+			h.cfg.Pool.RecordError(acct.UID)
 			// 流内业务错误（如 1005 plan 权益不足）→ 冷却账号并轮转下一账号。
 			var se *upstream.SOLOStreamError
 			if errors.As(err, &se) {
@@ -656,17 +695,23 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 				continue
 			}
+			st.status = http.StatusBadGateway
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			return
 		}
 		h.cfg.Pool.NoteSuccess(acct.UID)
+		h.cfg.Pool.RecordSuccess(acct.UID)
+		st.status = http.StatusOK
+		st.toks = completionTokens(resp)
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
 	// 所有账号耗尽/冷却，尝试 Work 通道兜底消费 work_credits
 	if handled, _ := h.executeWorkRequest(w, r, body, configName, peek.Stream, sessionKey); handled {
+		st.status = http.StatusOK
 		return
 	}
+	st.status = http.StatusServiceUnavailable
 	msg := "all accounts unavailable (cooling/disabled)"
 	if lastErr != nil {
 		msg += ": " + lastErr.Error()
